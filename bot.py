@@ -6,12 +6,12 @@ import logging
 import http.server
 import socketserver
 import threading
-from pathlib import Path
-from urllib.parse import quote
 import requests
 import urllib3
+from pathlib import Path
+from urllib.parse import quote
 from pyrogram import Client as PyroClient
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from ptbcontrib.aiohttp_request import AiohttpRequest
 
@@ -23,7 +23,9 @@ API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 PORT = int(os.environ.get("PORT", 10000))
 STREAM_BUCKET = "https://s3.todus.cu/stream"
-MAX_TELEGRAM_SIZE = 50 * 1024 * 1024  # 50 MB para enviar por Telegram
+WORK_DIR = "/tmp/restricted_jobs"
+PENDING_TTL = 900
+os.makedirs(WORK_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("downloader")
@@ -37,6 +39,21 @@ user_app = PyroClient(
     in_memory=True,
 )
 
+pending_txt = {}
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+
+
+def fmt_size(b):
+    if b < 1024: return f"{b} B"
+    if b < 1048576: return f"{b/1024:.1f} KB"
+    if b < 1073741824: return f"{b/1048576:.1f} MB"
+    return f"{b/1073741824:.2f} GB"
+
+
+def progress_bar(pct, width=15):
+    filled = round(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
 
 def parse_link(link):
     m = re.search(r"t\.me/c/(\d+)/(\d+)", link)
@@ -48,15 +65,8 @@ def parse_link(link):
     return None, None
 
 
-def fmt_size(b):
-    if b < 1024: return f"{b} B"
-    if b < 1048576: return f"{b/1024:.1f} KB"
-    if b < 1073741824: return f"{b/1048576:.1f} MB"
-    return f"{b/1073741824:.2f} GB"
-
-
 def upload_to_stream(local_path):
-    """Sube un archivo a s3.todus.cu/stream y devuelve la URL publica."""
+    """Sube un archivo a s3.todus.cu/stream."""
     filename = os.path.basename(local_path)
     prefix = uuid.uuid4().hex[:8]
     object_name = f"{prefix}_{filename}"
@@ -72,69 +82,185 @@ def upload_to_stream(local_path):
     return url
 
 
+class EditState:
+    def __init__(self):
+        self.last = 0.0
+        self.last_text = ""
+    def can_edit(self, text, force=False):
+        import time
+        now = time.time()
+        if force:
+            self.last = now; self.last_text = text; return True
+        if now - self.last < 2.0: return False
+        if text == self.last_text: return False
+        self.last = now; self.last_text = text; return True
+
+
+def _cleanup_pending():
+    import time
+    now = time.time()
+    for u in [k for k, v in pending_txt.items() if now - v.get("ts", 0) > PENDING_TTL]:
+        pending_txt.pop(u, None)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Envia un enlace de mensaje y lo extraigo.\n\n"
+        "Bot Restricted Downloader\n\n"
+        "Envía un archivo .txt con URLs de mensajes de canales restringidos.\n"
+        "Cada URL debe estar en una línea.\n\n"
         "Formatos:\n"
         "t.me/c/1234567890/456\n"
-        "t.me/canal/456\n\n"
-        "Los archivos grandes se suben a S3 y te devuelvo el enlace."
+        "t.me/canal/456"
     )
 
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = (update.message.text or "").strip()
-    chat, msg_id = parse_link(link)
-    if not chat:
-        await update.message.reply_text("Enlace invalido. Usa t.me/c/... o t.me/canal/...")
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa el .txt con múltiples enlaces de canales."""
+    uid = update.effective_user.id
+    doc = update.message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".txt"):
+        await update.message.reply_text("Solo acepto archivos .txt con URLs.")
         return
 
-    status = await update.message.reply_text("Extrayendo...")
+    status = await update.message.reply_text("📄 Leyendo archivo...")
 
     try:
+        file = await context.bot.get_file(doc.file_id)
+        content = await file.download_as_bytearray()
+        text = content.decode("utf-8", errors="ignore")
+
+        urls = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = URL_RE.search(line)
+            if m:
+                urls.append(m.group(0))
+
+        if not urls:
+            await status.edit_text("No encontre URLs en el archivo.")
+            return
+
+        total = len(urls)
+        state = EditState()
+
+        async def on_edit(txt, force=False):
+            if state.can_edit(txt, force):
+                try:
+                    await status.edit_text(txt)
+                except Exception:
+                    pass
+
+        await on_edit(f"🚀 Procesando {total} URLs...", force=True)
+
+        resultados = []
+        errores = []
+
+        async with user_app:
+            for i, url in enumerate(urls, 1):
+                await on_edit(f"📥 [{i}/{total}] Extrayendo...\n{url[:60]}", force=True)
+                try:
+                    chat, msg_id = parse_link(url)
+                    if not chat:
+                        errores.append(f"❌ Enlace invalido: {url[:50]}")
+                        continue
+
+                    msg = await user_app.get_messages(chat, msg_id)
+                    if not msg or not msg.media:
+                        errores.append(f"❌ Sin media: {url[:50]}")
+                        continue
+
+                    # Descargar
+                    temp_path = await user_app.download_media(msg, file_name=f"{WORK_DIR}/")
+                    if not temp_path:
+                        errores.append(f"❌ Sin descarga: {url[:50]}")
+                        continue
+
+                    size = os.path.getsize(temp_path)
+                    name = os.path.basename(temp_path)
+
+                    # Subir a S3
+                    await on_edit(f"⬆️ [{i}/{total}] Subiendo a S3...\n{name}", force=True)
+                    s3_url = await asyncio.to_thread(upload_to_stream, temp_path)
+
+                    resultados.append({"name": name, "size": size, "url": s3_url})
+
+                    # Limpiar archivo local
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    log.exception(f"Error en {url}")
+                    errores.append(f"❌ {url[:40]}: {str(e)[:60]}")
+
+        # ─── Armar respuesta formateada ───
+        partes = []
+        for r in resultados:
+            partes.append(
+                f"┎ NAME: {r['name']}\n"
+                f"┠ SIZE: {fmt_size(r['size'])}\n"
+                f"┖ URL: {r['url']}"
+            )
+
+        if errores:
+            partes.append("⚠️ Errores:\n" + "\n".join(errores[:5]))
+
+        respuesta = "\n\n".join(partes) if partes else "Sin resultados."
+        if len(respuesta) > 4000:
+            respuesta = respuesta[:4000] + "\n...(truncado)"
+
+        await status.edit_text(respuesta)
+
+    except Exception as e:
+        log.exception("Error leyendo txt")
+        await status.edit_text(f"Error: {str(e)[:200]}")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Si escribe una URL suelta, la procesa."""
+    text = (update.message.text or "").strip()
+    m = URL_RE.search(text)
+    if not m:
+        await update.message.reply_text("Envia un archivo .txt o una URL.")
+        return
+
+    url = m.group(0)
+    status = await update.message.reply_text("📥 Extrayendo...")
+
+    try:
+        chat, msg_id = parse_link(url)
+        if not chat:
+            await status.edit_text("Enlace invalido. Usa t.me/c/... o t.me/canal/...")
+            return
+
         async with user_app:
             msg = await user_app.get_messages(chat, msg_id)
-            if not msg:
-                await status.edit_text("Mensaje no encontrado.")
+            if not msg or not msg.media:
+                await status.edit_text("Sin media en el mensaje.")
                 return
-            path = await user_app.download_media(msg, file_name="/tmp/")
+            temp_path = await user_app.download_media(msg, file_name=f"{WORK_DIR}/")
 
-        if not path:
-            text = msg.text or msg.caption or "(sin contenido)"
-            await status.edit_text(f"Texto:\n\n{text}")
+        if not temp_path:
+            await status.edit_text("No se pudo descargar.")
             return
 
-        size = os.path.getsize(path)
-        name = os.path.basename(path)
-        log.info(f"Descargado: {name} ({fmt_size(size)})")
+        size = os.path.getsize(temp_path)
+        name = os.path.basename(temp_path)
 
-        # Si es pequeño, enviar directo por Telegram
-        if size <= MAX_TELEGRAM_SIZE:
-            await status.edit_text(f"Enviando archivo ({fmt_size(size)})...")
-            await update.message.reply_document(path)
-            await status.delete()
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-            return
-
-        # Si es grande, subir a S3
-        await status.edit_text(f"Subiendo a S3 ({fmt_size(size)})...")
-        s3_url = await asyncio.to_thread(upload_to_stream, path)
+        await status.edit_text(f"⬆️ Subiendo a S3 ({fmt_size(size)})...")
+        s3_url = await asyncio.to_thread(upload_to_stream, temp_path)
 
         await status.edit_text(
-            f"Archivo subido\n\n"
-            f"Nombre: {name}\n"
-            f"Tamanio: {fmt_size(size)}\n"
-            f"Enlace: {s3_url}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Descargar", url=s3_url)
-            ]])
+            f"┎ NAME: {name}\n"
+            f"┠ SIZE: {fmt_size(size)}\n"
+            f"┖ URL: {s3_url}"
         )
 
         try:
-            os.unlink(path)
+            os.unlink(temp_path)
         except Exception:
             pass
 
@@ -167,7 +293,8 @@ def main():
         .build()
     )
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot listo. Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
