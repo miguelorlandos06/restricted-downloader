@@ -5,8 +5,10 @@ import logging
 import http.server
 import socketserver
 import threading
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram import Client as PyroClient
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from ptbcontrib.aiohttp_request import AiohttpRequest
 
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
@@ -16,20 +18,14 @@ PORT = int(os.environ.get("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("downloader")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-user_app = Client(
+# Cliente de usuario (Pyrogram) - solo se conecta bajo demanda
+user_app = PyroClient(
     "user_dl",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
-    in_memory=True,
-)
-
-bot_app = Client(
-    "bot_dl",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
     in_memory=True,
 )
 
@@ -44,9 +40,8 @@ def parse_link(link):
     return None, None
 
 
-@bot_app.on_message(filters.command("start") & filters.private)
-async def cmd_start(client, message):
-    await message.reply_text(
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "Envia un enlace de mensaje y lo extraigo.\n\n"
         "Formatos:\n"
         "t.me/c/1234567890/456\n"
@@ -54,15 +49,14 @@ async def cmd_start(client, message):
     )
 
 
-@bot_app.on_message(filters.text & filters.private & ~filters.command(["start"]))
-async def handle_link(client, message: Message):
-    link = message.text.strip()
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link = (update.message.text or "").strip()
     chat, msg_id = parse_link(link)
     if not chat:
-        await message.reply_text("Enlace invalido. Usa t.me/c/... o t.me/canal/...")
+        await update.message.reply_text("Enlace invalido. Usa t.me/c/... o t.me/canal/...")
         return
 
-    status = await message.reply_text("Extrayendo...")
+    status = await update.message.reply_text("Extrayendo...")
 
     try:
         async with user_app:
@@ -70,12 +64,11 @@ async def handle_link(client, message: Message):
             if not msg:
                 await status.edit_text("Mensaje no encontrado.")
                 return
-
             path = await user_app.download_media(msg, file_name="/tmp/")
 
         if path:
             await status.edit_text("Enviando archivo...")
-            await message.reply_document(path)
+            await update.message.reply_document(path)
             await status.delete()
             try:
                 os.unlink(path)
@@ -97,22 +90,27 @@ def run_health_server():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
-
         def log_message(self, *args):
             pass
-
     with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
         httpd.serve_forever()
 
 
-async def main():
+def main():
     threading.Thread(target=run_health_server, daemon=True).start()
-    await bot_app.start()
-    me = await bot_app.get_me()
-    log.info(f"Bot listo: @{me.username}")
-    log.info("Esperando enlaces...")
-    await asyncio.Event().wait()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(AiohttpRequest(connection_pool_size=256))
+        .get_updates_request(AiohttpRequest())
+        .build()
+    )
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    log.info("Bot listo. Polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

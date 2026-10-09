@@ -1,3 +1,5 @@
 pyrogram>=2.0.106
 tgcrypto>=1.2.5
 python-telegram-bot>=21.0
+ptbcontrib @ git+https://github.com/python-telegram-bot/ptbcontrib.git@main
+aiohttp
